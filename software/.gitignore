@@ -1,0 +1,8 @@
+.runtime/
+.venv/
+__pycache__/
+logs/
+sessions/
+telemetry/
+*.log
+*_check.png

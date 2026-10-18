@@ -1,0 +1,2 @@
+# Preserve the tested launcher BOM and all source bytes across Windows checkouts.
+* -text

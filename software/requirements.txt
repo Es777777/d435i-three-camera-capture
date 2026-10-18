@@ -1,0 +1,13 @@
+# Validated on the bundled CPython 3.12 x64 runtime.
+numpy==2.2.6
+opencv-python==5.0.0.93
+pyrealsense2==2.56.5.9235
+PyYAML==6.0.2
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.17.0
+sounddevice==0.5.1
+scipy==1.15.3
+cffi==1.17.1
+pycparser==2.22
+imageio-ffmpeg==0.6.0

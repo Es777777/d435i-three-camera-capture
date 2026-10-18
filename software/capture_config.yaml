@@ -1,0 +1,11 @@
+session_id: face_001
+expected_cameras: 1
+serials: []
+output_root: sessions
+resolution: [1280, 720]
+fps: 30
+recording_mode: balanced
+video_buffer_mb: 256
+emitter_enabled: false
+laser_power: 150
+# Select Master / Slave 1 / Slave 2 in the unified capture UI before starting the camera.
