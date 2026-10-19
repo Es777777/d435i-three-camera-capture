@@ -48,6 +48,8 @@ class SessionWriter:
         self.close_lock = threading.Lock()
         self.error = None
         self.error_category = None
+        self.stop_reason = None
+        self.audio_status = None
         self.rejected_sample = None
         self.counts, self.accepted, self.gaps, self.last_numbers = {}, {}, {}, {}
         self.accepting, self.closed = True, False
@@ -164,6 +166,7 @@ class SessionWriter:
             if self.counts != self.accepted:
                 self._fail('已接收样本与写入索引数量不一致；录像不完整，详见样本计数。', 'sample_count_mismatch')
             summary = dict(complete=not bool(self.error), error=self.error, error_category=self.error_category,
+                           stop_reason=self.stop_reason, audio_status=self.audio_status,
                            received_sample_counts=dict(self.counts), accepted_sample_counts=dict(self.accepted),
                            rejected_sample=self.rejected_sample, frame_number_gaps=dict(self.gaps),
                            video_files=video_files, total_video_bytes=sum(v['bytes'] for v in video_files),

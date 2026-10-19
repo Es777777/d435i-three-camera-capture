@@ -20,6 +20,8 @@ class AudioRecorder:
         self.device = device
         self.queue = queue.Queue(maxsize=256)
         self.error = None
+        self.status_count = 0
+        self.last_status = None
         self.samples = 0
         self.level = 0.
         self.stream = None
@@ -50,7 +52,10 @@ class AudioRecorder:
                    first_sample_host_ns=int(now+(adc-current)*1e9) if valid_adc else None,
                    status=str(status))
         if status:
-            self.error = 'Audio input overflow/status: '+str(status)
+            # PortAudio status describes a discontinuity, not a dead stream.
+            # Keep recording subsequent blocks and preserve the warning for QA.
+            self.status_count += 1
+            self.last_status = str(status)
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
         self.level = float(np.sqrt(np.mean(samples*samples))/32768.) if len(samples) else 0.
         try:
@@ -96,6 +101,7 @@ class AudioRecorder:
             self.thread.join()
         (self.root/'audio.json').write_text(json.dumps(dict(
             rate=self.rate, channels=1, sample_width=2, samples=self.samples,
-            complete=not bool(self.error), error=self.error,
+            complete=not bool(self.error or self.status_count), error=self.error,
+            status_count=self.status_count, last_status=self.last_status,
             device=getattr(self, 'device_info', {}),
             clock='PortAudio ADC mapped to host monotonic; not hardware-synced to cameras'), indent=2), encoding='utf8')

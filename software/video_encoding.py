@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 import subprocess
+import threading
+import time
 
 import imageio_ffmpeg
 
@@ -27,7 +29,7 @@ def encoding_args(codec, fps):
 
 
 class FFmpegWriter:
-    def __init__(self, path, codec, fps, shape):
+    def __init__(self, path, codec, fps, shape, write_timeout=30.):
         self.path = Path(path)
         self.closed = False
         self.shape = shape
@@ -46,13 +48,39 @@ class FFmpegWriter:
         except Exception:
             self.log.close()
             raise
+        self.write_timeout = write_timeout
+        self.operation_started = None
+        self.timed_out = False
+        self.watchdog_stop = threading.Event()
+        self.watchdog = threading.Thread(target=self._watch_encoder, name='EncoderWatchdog', daemon=True)
+        self.watchdog.start()
+
+    def _watch_encoder(self):
+        while not self.watchdog_stop.wait(.25):
+            started = self.operation_started
+            if started is not None and time.monotonic()-started > self.write_timeout:
+                self.timed_out = True
+                # Killing the reader also releases a writer blocked on stdin.
+                try:
+                    self.process.kill()
+                except OSError:
+                    pass
+                return
 
     def write(self, image):
         if image.shape != self.shape or str(image.dtype) != 'uint8':
             raise ValueError('Video image format changed during recording')
         if self.process.poll() is not None:
             raise RuntimeError('Video encoder exited before recording finished')
-        self.process.stdin.write(image.tobytes())
+        self.operation_started = time.monotonic()
+        try:
+            self.process.stdin.write(image.tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            if self.timed_out:
+                raise RuntimeError('Video encoder stalled; stopped waiting for input pipe') from exc
+            raise
+        finally:
+            self.operation_started = None
 
     def release(self):
         if self.closed:
@@ -60,9 +88,12 @@ class FFmpegWriter:
         self.closed = True
         try:
             try:
+                self.operation_started = time.monotonic()
                 self.process.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
+            finally:
+                self.operation_started = None
             try:
                 code = self.process.wait(timeout=120)
             except subprocess.TimeoutExpired:
@@ -70,7 +101,11 @@ class FFmpegWriter:
                 self.process.wait()
                 raise RuntimeError('Video encoder finalization timed out')
         finally:
+            self.watchdog_stop.set()
+            self.watchdog.join()
             self.log.close()
+        if self.timed_out:
+            raise RuntimeError('Video encoder stalled; partial video may be incomplete')
         if code:
             detail = self.log_path.read_text(encoding='utf8', errors='replace')[-2000:]
             raise RuntimeError(f'Video encoder failed ({code}): {detail}')

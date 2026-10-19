@@ -208,6 +208,7 @@ class Main(QtWidgets.QMainWindow):
         self.seen = {}
         self.reconstruction_window = None
         self.recording_active = False
+        self.recording_saving = False
         self.last_highlight = 0.
         self.benchmark_process = None
         target_file = ROOT/'points_blender52_final.json'
@@ -342,7 +343,7 @@ class Main(QtWidgets.QMainWindow):
         self.start_button.clicked.connect(self.start_camera)
         self.stop_button.clicked.connect(self.stop_camera)
         self.record_button.clicked.connect(self.start_recording)
-        self.record_stop.clicked.connect(lambda: self.worker.command('stop_record') if self.worker else None)
+        self.record_stop.clicked.connect(self.stop_recording)
         self.emitter_button.toggled.connect(self.set_emitter)
         browse.clicked.connect(self.choose_folder)
         self.freeze_button.clicked.connect(self.open_calibration)
@@ -452,6 +453,7 @@ class Main(QtWidgets.QMainWindow):
         self.worker.status.connect(self.msg)
         self.worker.ready.connect(self.camera_ready)
         self.worker.recording.connect(self.recording_changed)
+        self.worker.saving.connect(self.recording_save_started)
         self.worker.emitter_state.connect(self.emitter_changed)
         self.worker.health.connect(self.show_health)
         self.worker.finished.connect(self.camera_finished)
@@ -487,6 +489,8 @@ class Main(QtWidgets.QMainWindow):
             reason = '正在测试保存目录写入速度，请等待结果后再录像。'
         elif not self.worker or not self.meta:
             reason = '请先开启相机，等待画面就绪。'
+        elif self.recording_saving:
+            reason = '已停止接收新帧，正在写完缓存并检查文件，请等待保存完成。'
         elif self.recording_active:
             reason = '正在录像；每帧时间戳和本机位姿编号随录像保存。'
         elif not self.calibration:
@@ -642,6 +646,7 @@ class Main(QtWidgets.QMainWindow):
         self.worker = None
         self.meta = None
         self.recording_active = False
+        self.recording_saving = False
         self.audio_device.setEnabled(True)
         self.start_button.setEnabled(self.sync_role is not None)
         for button in self.role_buttons.values():
@@ -651,6 +656,10 @@ class Main(QtWidgets.QMainWindow):
         self.load_rig_button.setEnabled(False)
         self.freeze_button.setEnabled(False)
         self.record_stop.setEnabled(False)
+        self.record_stop.setText('停止录像并保存')
+        self.path.setEnabled(True)
+        self.emitter_button.setEnabled(True)
+        self.reconstruction_button.setEnabled(True)
         self.state.setText('相机已停止')
 
     def stop_camera(self):
@@ -658,8 +667,21 @@ class Main(QtWidgets.QMainWindow):
             self.worker.command('quit')
             self.msg('正在停止并写完文件…')
 
+    def stop_recording(self):
+        if self.worker and self.recording_active and not self.recording_saving:
+            self.recording_save_started('')
+            self.msg('已请求停止录像，正在结束采集并保存文件…')
+            self.worker.command('stop_record')
+
+    def recording_save_started(self, path):
+        self.recording_saving = True
+        self.record_stop.setEnabled(False)
+        self.record_stop.setText('正在保存…')
+        self.state.setText('正在停止并保存录像…')
+        self.update_recording_ready()
+
     def start_recording(self):
-        if not self.worker or not self.meta:
+        if not self.worker or not self.meta or self.recording_active or self.recording_saving:
             return
         if self.benchmark_process and self.benchmark_process.state() != QtCore.QProcess.NotRunning:
             self.msg('请等待录制测速完成后再开始录像')
@@ -697,7 +719,9 @@ class Main(QtWidgets.QMainWindow):
 
     def recording_changed(self, active, path):
         self.recording_active = active
-        self.state.setText('录像中' if active else '录像已保存，详见日志')
+        self.recording_saving = False
+        self.record_stop.setText('停止录像并保存')
+        self.state.setText('录像中' if active else '录像已结束，请查看保存结果')
         self.state.setStyleSheet('color:#bd2828' if active else '')
         self.update_recording_ready()
         self.record_stop.setEnabled(active)

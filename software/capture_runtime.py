@@ -40,6 +40,7 @@ class CaptureWorker(QtCore.QThread):
     status = QtCore.pyqtSignal(str)
     ready = QtCore.pyqtSignal(object)
     recording = QtCore.pyqtSignal(bool, str)
+    saving = QtCore.pyqtSignal(str)
     emitter_state = QtCore.pyqtSignal(bool)
     health = QtCore.pyqtSignal(object)
 
@@ -47,6 +48,7 @@ class CaptureWorker(QtCore.QThread):
         super().__init__()
         self.cfg = dict(cfg)
         self.commands = queue.Queue()
+        self.stop_requested = threading.Event()
         self.lock = threading.RLock()
         self.latest = {}
         self.windows = {}
@@ -58,6 +60,9 @@ class CaptureWorker(QtCore.QThread):
         self.last_sample = time.monotonic()
         self.callback_error = None
         self.audio = None
+        self.finalizer = None
+        self.finalizing_writer = None
+        self.audio_status_count = 0
         self.health_samples = {}
         self.telemetry = queue.Queue(maxsize=20000)
         self.telemetry_file = None
@@ -67,6 +72,10 @@ class CaptureWorker(QtCore.QThread):
             return dict(self.latest)
 
     def command(self, *args):
+        if args and args[0] in ('stop_record', 'quit'):
+            # Stop accepting video/IMU immediately, even if the control thread
+            # is currently waiting on a filesystem health query.
+            self.stop_requested.set()
         self.commands.put(args)
 
     def recording_metadata(self, calibration, rig=None, options=None):
@@ -158,32 +167,74 @@ class CaptureWorker(QtCore.QThread):
                         self.first.set()
                 self.last_sample = time.monotonic()
             with self.lock:
-                if self.writer:
+                if self.writer and not self.stop_requested.is_set():
                     self.writer.submit(rec, image)
         except Exception:
             self.callback_error = traceback.format_exc()
 
-    def _finish_recording(self):
+    def _finish_recording(self, reason='manual_stop'):
         with self.lock:
             writer, self.writer = self.writer, None
         if writer:
+            audio, self.audio = self.audio, None
+            self.finalizing_writer = writer
+            writer.stop_reason = reason
+            self.saving.emit(str(writer.root))
+            if writer.error:
+                self.status.emit('录像已停止：'+writer.error)
             self.status.emit('正在写完录像并检查视频解码，请稍候…')
-            if self.audio:
-                try:
-                    self.audio.close()
-                    if self.audio.error:
-                        writer.error = 'Audio: '+self.audio.error
-                except Exception as exc:
-                    writer.error = 'Audio close: '+str(exc)
-                self.audio = None
+            # Encoding and validation can take minutes on slow storage. Keep the
+            # capture loop alive to drain telemetry and service camera commands.
+            self.finalizer = threading.Thread(target=self._save_recording,
+                args=(writer, audio), name='RecordingFinalizer')
+            self.finalizer.start()
+
+    def _save_recording(self, writer, audio):
+        if audio:
+            try:
+                audio.close()
+                if audio.error:
+                    writer._fail('Audio: '+audio.error, 'audio_failed')
+                if audio.status_count:
+                    writer._fail('音频输入存在中断；视频和可用音频已保存，请检查 audio.json。',
+                                 'audio_discontinuity')
+                writer.audio_status = dict(complete=not bool(audio.error or audio.status_count),
+                    error=audio.error, status_count=audio.status_count, last_status=audio.last_status)
+            except Exception as exc:
+                writer._fail('Audio close: '+str(exc), 'audio_close_failed')
+        try:
             writer.close()
+        except Exception as exc:
+            logging.exception('recording finalization failed')
+            writer._fail('保存录像失败：'+str(exc), 'recording_finalize_failed')
+
+    def _poll_recording_finish(self):
+        if self.finalizer is not None and not self.finalizer.is_alive():
+            self.finalizer.join()
+            writer = self.finalizing_writer
+            self.finalizer = self.finalizing_writer = None
             self.recording.emit(False, str(writer.root))
             self.status.emit(('录像不完整：' + writer.error) if writer.error else '已保存：' + str(writer.root))
             if not writer.error:
-                summary = json.loads((writer.root/'summary.json').read_text(encoding='utf8'))
-                for file in summary.get('video_files', []):
-                    self.status.emit(f'{file["file"]}：{file["frames"]} 帧，'
-                        f'{file["duration_seconds"]:.1f} 秒，{file["bytes"]/1e6:.1f} MB；首、中、尾帧回读通过')
+                try:
+                    summary = json.loads((writer.root/'summary.json').read_text(encoding='utf8'))
+                    for file in summary.get('video_files', []):
+                        self.status.emit(f'{file["file"]}：{file["frames"]} 帧，'
+                            f'{file["duration_seconds"]:.1f} 秒，{file["bytes"]/1e6:.1f} MB；首、中、尾帧回读通过')
+                except Exception as exc:
+                    self.status.emit('无法读取保存检查结果：'+str(exc))
+
+    def _drain_telemetry(self):
+        # A continuous producer must not starve stop/quit commands.
+        deadline = time.monotonic()+.01
+        for _ in range(1000):
+            try:
+                rec = self.telemetry.get_nowait()
+            except queue.Empty:
+                break
+            self.telemetry_file.write(json.dumps(rec)+'\n')
+            if time.monotonic() >= deadline:
+                break
 
     def run(self):
         try:
@@ -274,8 +325,8 @@ class CaptureWorker(QtCore.QThread):
             self.status.emit(f'{w}x{h}@{fps} 三路已启动；IR emitter={int(self.emitter_enabled)}')
             last_health = 0.
             while self.running:
-                while not self.telemetry.empty():
-                    self.telemetry_file.write(json.dumps(self.telemetry.get_nowait())+'\n')
+                self._poll_recording_finish()
+                self._drain_telemetry()
                 if time.monotonic()-last_health >= 1:
                     with self.lock:
                         health = frame_health(self.health_samples, time.monotonic_ns(), fps)
@@ -295,6 +346,10 @@ class CaptureWorker(QtCore.QThread):
                                   host_monotonic_ns=time.monotonic_ns(),
                                   audio_level=self.audio.level if self.audio else None)
                     self.health.emit(health)
+                    if self.audio and self.audio.status_count != self.audio_status_count:
+                        self.audio_status_count = self.audio.status_count
+                        self.status.emit(f'音频输入出现中断（累计 {self.audio_status_count} 次）：'
+                            f'{self.audio.last_status}；视频继续录制，音频异常已记录。')
                     self.telemetry_file.write(json.dumps(dict(event='health', **health))+'\n')
                     self.telemetry_file.flush()
                     last_health = time.monotonic()
@@ -312,7 +367,7 @@ class CaptureWorker(QtCore.QThread):
                             label=str(command[1]), host_monotonic_ns=time.monotonic_ns()))+'\n')
                         self.telemetry_file.flush()
                         self.status.emit('同步测试事件已记入持续日志：'+str(command[1]))
-                    elif command[0] == 'emitter' and self.writer is None:
+                    elif command[0] == 'emitter' and self.writer is None and self.finalizer is None:
                         try:
                             self._set_emitter(self.depth_sensor, bool(command[1]))
                             self.emitter_enabled = bool(command[1])
@@ -327,7 +382,7 @@ class CaptureWorker(QtCore.QThread):
                                 self.metadata['emitter_enabled'] = int(actual)
                                 self.emitter_state.emit(actual)
                             self.status.emit(f'IR emitter 切换失败: {exc}')
-                    elif command[0] == 'record' and self.writer is None:
+                    elif command[0] == 'record' and self.writer is None and self.finalizer is None:
                         if not self.first.is_set():
                             self.status.emit('三路画面尚未到齐，未开始录像')
                             continue
@@ -369,6 +424,7 @@ class CaptureWorker(QtCore.QThread):
                             self.status.emit('无法开始写入，请检查空间、路径和权限：'+str(exc))
                             continue
                         try:
+                            self.audio_status_count = 0
                             self.audio = AudioRecorder(root, self.cfg.get('audio_device'),
                                                        self.cfg.get('audio_rate', 48000))
                             self.audio.start()
@@ -384,15 +440,17 @@ class CaptureWorker(QtCore.QThread):
                             self.status.emit('麦克风启动失败，录像未开始：'+str(exc))
                             continue
                         with self.lock:
+                            self.stop_requested.clear()
                             self.writer = writer
                         self.recording.emit(True, str(root))
                         self.status.emit('正在录像：' + str(root))
                 if self.callback_error:
                     raise RuntimeError(self.callback_error)
                 if self.writer and self.writer.error:
-                    self._finish_recording()
+                    self._finish_recording(self.writer.error_category or 'writer_error')
                 if self.writer and self.audio and self.audio.error:
-                    self._finish_recording()
+                    self.writer._fail('Audio: '+self.audio.error, 'audio_failed')
+                    self._finish_recording('audio_failed')
                 if self.first.is_set():
                     with self.lock:
                         stale = [name for name in ('rgb','ir1','ir2')
@@ -404,7 +462,7 @@ class CaptureWorker(QtCore.QThread):
         except Exception as exc:
             with self.lock:
                 if self.writer:
-                    self.writer.error = self.writer.error or str(exc)
+                    self.writer._fail(str(exc), 'capture_error')
             logging.exception('capture failed')
             self.status.emit('错误：' + str(exc))
         finally:
@@ -419,7 +477,10 @@ class CaptureWorker(QtCore.QThread):
                     self.pipe.stop()
                 except RuntimeError:
                     pass
-            self._finish_recording()
+            self._finish_recording('capture_error' if self.writer and self.writer.error else 'camera_closed')
+            if self.finalizer is not None:
+                self.finalizer.join()
+                self._poll_recording_finish()
             if self.telemetry_file:
                 while not self.telemetry.empty():
                     self.telemetry_file.write(json.dumps(self.telemetry.get_nowait())+'\n')
