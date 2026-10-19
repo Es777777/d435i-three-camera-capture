@@ -2,11 +2,11 @@
 
 三台 Windows 电脑各连接一台 RealSense D435i，采集 RGB、双红外、音频和 IMU；完成本机标定后直接录像，汇总时再做三机坐标结算、重建与融合。
 
-当前版本 **v1.0.0**。支持 Intel/AMD 64 位 Windows 10/11。
+当前版本 **v1.0.0（录像停止修复版）**。支持 Intel/AMD 64 位 Windows 10/11。
 
 ## 下载与启动
 
-**[下载 v1.0.0 在线包](https://github.com/Es777777/d435i-three-camera-capture/releases/download/v1.0.0/D435I_ThreeHost_v1.0.0.zip)** · [所有发布版本](https://github.com/Es777777/d435i-three-camera-capture/releases)
+**[下载录像修复版完整在线包](https://github.com/Es777777/d435i-three-camera-capture/releases/download/v1.0.0-recording-fix/D435I_ThreeHost_recording_fix.zip)** · [所有发布版本](https://github.com/Es777777/d435i-three-camera-capture/releases)
 
 1. 完整解压在线包，双击其中的 **`启动数采.bat`**。
 2. 首次自动准备专用 Python、固定版本依赖和视频编码器，需联网下载约 220 MB。无需手动安装 Python 或修改系统 PATH。
@@ -15,6 +15,8 @@
 5. 汇集三个完整 session，分别重建，再进行三机合成和回放。
 
 从源码使用时，也可以双击仓库根目录的 `启动数采.bat`。完整操作见 [软件使用说明](software/README.md)。
+
+本次修复停止按钮响应、保存阻塞及短暂音频溢出导致录像自动结束的问题；完整说明与验证边界见 [录像停止修复](docs/v1.0.0录像停止修复.md)。
 
 ## 当前功能
 
